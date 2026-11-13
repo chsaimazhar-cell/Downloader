@@ -21,7 +21,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 $env:DRIFT_HOST = "127.0.0.1"
 $env:DRIFT_PORT = "5000"
-python "drift (1).py"
+python drift.py
 ```
 
 Open http://127.0.0.1:5000 in your browser. Press Ctrl+C in the terminal to stop the server.
@@ -79,7 +79,7 @@ These tests cover input validation and utility functions. They do not download r
 
 ## Project files
 
-- `drift (1).py` — HTTP server, embedded HTML/CSS/JavaScript, job queue, SQLite storage, validation, and download handling.
+- `drift.py` — HTTP server, embedded HTML/CSS/JavaScript, job queue, SQLite storage, validation, and download handling.
 - `requirements.txt` — Python dependencies.
 - `Dockerfile` — container build and runtime configuration.
 - `tests/` — automated unit tests.
