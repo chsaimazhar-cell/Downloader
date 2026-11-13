@@ -1599,10 +1599,12 @@ def validate_public_url(raw_url: str):
         parsed = urlparse(raw_url.strip())
         if parsed.scheme.lower() not in ALLOWED_SCHEMES or not parsed.hostname:
             return False, "Only HTTP(S) URLs are supported."
+        if parsed.username is not None or parsed.password is not None:
+            return False, "URLs containing usernames or passwords are not allowed."
         host = parsed.hostname.lower().rstrip(".")
         try:
             ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            if not ip.is_global:
                 return False, "Private or internal addresses are not allowed."
         except ValueError:
             pass
@@ -1614,7 +1616,7 @@ def validate_public_url(raw_url: str):
             infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
             for info in infos:
                 ip = ipaddress.ip_address(info[4][0])
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                if not ip.is_global:
                     return False, "Private or internal addresses are not allowed."
         except socket.gaierror:
             return False, "The hostname could not be resolved."
