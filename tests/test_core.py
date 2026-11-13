@@ -15,7 +15,7 @@ TEST_ROOT = Path(tempfile.mkdtemp(prefix="downloader-tests-"))
 os.environ["DRIFT_DOWNLOAD_ROOT"] = str(TEST_ROOT)
 os.environ["DRIFT_DB_PATH"] = str(TEST_ROOT / "test.sqlite3")
 
-SOURCE = Path(__file__).resolve().parents[1] / "drift (1).py"
+SOURCE = Path(__file__).resolve().parents[1] / "drift.py"
 SPEC = importlib.util.spec_from_file_location("downloader_app_under_test", SOURCE)
 downloader = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
