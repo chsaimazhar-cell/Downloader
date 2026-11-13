@@ -8,6 +8,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -1599,10 +1600,12 @@ def validate_public_url(raw_url: str):
         parsed = urlparse(raw_url.strip())
         if parsed.scheme.lower() not in ALLOWED_SCHEMES or not parsed.hostname:
             return False, "Only HTTP(S) URLs are supported."
+        if parsed.username is not None or parsed.password is not None:
+            return False, "URLs containing usernames or passwords are not allowed."
         host = parsed.hostname.lower().rstrip(".")
         try:
             ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            if not ip.is_global:
                 return False, "Private or internal addresses are not allowed."
         except ValueError:
             pass
@@ -1614,7 +1617,7 @@ def validate_public_url(raw_url: str):
             infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
             for info in infos:
                 ip = ipaddress.ip_address(info[4][0])
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                if not ip.is_global:
                     return False, "Private or internal addresses are not allowed."
         except socket.gaierror:
             return False, "The hostname could not be resolved."
@@ -1730,21 +1733,135 @@ class DownloadCancelled(Exception): pass
 class DownloadTooLarge(Exception): pass
 
 
+
+MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".3gp", ".ts"}
+
+
+def find_ffmpeg() -> str | None:
+    """Return the FFmpeg executable when it is installed on PATH."""
+    return shutil.which("ffmpeg")
+
+
+def probe_media(media: Path) -> dict:
+    """Read codecs with `ffmpeg -i` (works without ffprobe)."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is not available. Install FFmpeg and restart Drift.")
+    out = subprocess.run([ffmpeg, "-hide_banner", "-i", str(media)], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace").stderr
+    info = {"container": "", "video": [], "audio": []}
+    m = re.search(r"Input #0, ([^,]+(?:,[^,]+)*?), from", out)
+    if m:
+        info["container"] = m.group(1)
+    for line in out.splitlines():
+        if "Stream #" not in line:
+            continue
+        if " Video:" in line and "attached pic" not in line:
+            codec = re.search(r"Video: (\w+)", line)
+            profile = re.search(r"Video: \w+ \(([^)]*)\)", line)
+            pix = re.search(r"\b(yuvj?\d{3}p\w*|nv12|gbrp\w*|rgba?|bgra?|gray\w*|pal8)\b", line)
+            dims = re.search(r",\s*(\d{2,5})x(\d{2,5})", line)
+            info["video"].append({
+                "codec": codec.group(1) if codec else "",
+                "profile": profile.group(1) if profile else "",
+                "pix_fmt": pix.group(1) if pix else "",
+                "w": int(dims.group(1)) if dims else 0,
+                "h": int(dims.group(2)) if dims else 0,
+            })
+        elif " Audio:" in line:
+            codec = re.search(r"Audio: (\w+)", line)
+            info["audio"].append(codec.group(1) if codec else "")
+    return info
+
+
+def ensure_compatible_mp4(media: Path, job_id: str) -> Path:
+    """Return an MP4 (H.264 + AAC, yuv420p) that plays in Windows Media Player, phones, WhatsApp, everything.
+
+    Files that are already compatible are left untouched (fast). Otherwise only what is needed is re-encoded.
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is not available. Install FFmpeg and restart Drift.")
+    info = probe_media(media)
+    if not info["video"]:
+        raise RuntimeError("The downloaded file has no video track.")
+    v = info["video"][0]
+    video_ok = (v["codec"] == "h264"
+                and v["pix_fmt"] in {"yuv420p", "yuvj420p"}
+                and v["profile"] in {"Baseline", "Constrained Baseline", "Main", "High"}
+                and v["w"] % 2 == 0 and v["h"] % 2 == 0)
+    audio_ok = all(c == "aac" for c in info["audio"])
+    container_ok = "mp4" in info["container"].split(",")
+    if video_ok and audio_ok and container_ok and media.suffix.lower() == ".mp4":
+        return media
+
+    output = tempfile.NamedTemporaryFile(prefix="drift-compatible-", suffix=".mp4", dir=media.parent, delete=False)
+    output_path = Path(output.name)
+    output.close()
+    update_job(job_id, status="processing", phase="Processing", progress=100, speed=None, eta=None,
+               message="Making the video playable everywhere (converting)…")
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(media), "-map", "0:v:0", "-map", "0:a:0?"]
+    if video_ok:
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "21", "-pix_fmt", "yuv420p", "-profile:v", "high"]
+    if audio_ok:
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    cmd += ["-movflags", "+faststart", str(output_path)]
+    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                               encoding="utf-8", errors="replace")
+    try:
+        while True:
+            try:
+                _, error_output = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                event = CANCEL_EVENTS.get(job_id)
+                if event and event.is_set():
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                    raise DownloadCancelled()
+        if process.returncode:
+            raise RuntimeError(f"FFmpeg could not create a playable MP4: {(error_output or '')[-600:].strip()}")
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg produced an empty file.")
+        return output_path
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
+
 def find_media(job_dir: Path) -> Path | None:
-    candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
+    candidates = [
+        p for p in job_dir.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in MEDIA_SUFFIXES
+        and ".part" not in p.name.lower()
+        and not re.search(r"\.f\d+\.", p.name)
+    ]
+    if not candidates:
+        candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
     return max(candidates, key=lambda p: p.stat().st_size) if candidates else None
 
 
 def run_download(job_id: str, url: str, quality: str) -> None:
-    early = CANCEL_EVENTS.get(job_id)
-    if early and early.is_set():
-        update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-        CANCEL_EVENTS.pop(job_id, None)
-        return
-    job_dir = Path(tempfile.mkdtemp(prefix=f"drift-{job_id}-", dir=DOWNLOAD_ROOT))
-    update_job(job_id, job_dir=str(job_dir), status="downloading", phase="Downloading", progress=0,
-               message="Starting media transfer…")
+    job_dir = None
     try:
+        early = CANCEL_EVENTS.get(job_id)
+        if early and early.is_set():
+            update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
+            return
+        job_dir = Path(tempfile.mkdtemp(prefix=f"drift-{job_id}-", dir=DOWNLOAD_ROOT))
+        update_job(job_id, job_dir=str(job_dir), status="downloading", phase="Downloading", progress=0,
+                   message="Starting media transfer…")
         if yt_dlp is None:
             raise RuntimeError("yt-dlp is not installed. Run: python -m pip install -r requirements.txt")
         options = {
@@ -1757,15 +1874,23 @@ def run_download(job_id: str, url: str, quality: str) -> None:
             "continuedl": True, "retries": 3, "fragment_retries": 3, "socket_timeout": 20,
             "quiet": True,
         }
-        if CERTIFI_CA: options["ca_certs"] = CERTIFI_CA
+        if CERTIFI_CA:
+            options["ca_certs"] = CERTIFI_CA
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
         event = CANCEL_EVENTS.get(job_id)
-        if event and event.is_set(): raise DownloadCancelled()
+        if event and event.is_set():
+            raise DownloadCancelled()
         media = find_media(job_dir)
-        if media is None: raise RuntimeError("The media file was not created.")
+        if media is None:
+            raise RuntimeError("The media file was not created.")
+        media = ensure_compatible_mp4(media, job_id)
+        event = CANCEL_EVENTS.get(job_id)
+        if event and event.is_set():
+            raise DownloadCancelled()
         size = media.stat().st_size
-        if size > MAX_DOWNLOAD_BYTES: raise DownloadTooLarge("The final media file exceeded Drift's 500 MB limit.")
+        if size > MAX_DOWNLOAD_BYTES:
+            raise DownloadTooLarge("The final media file exceeded Drift's 500 MB limit.")
         title = info.get("title") or "Drift video"
         duration = info.get("duration_string")
         final_name = safe_filename(title)
@@ -1777,22 +1902,25 @@ def run_download(job_id: str, url: str, quality: str) -> None:
                    message="Your MP4 is ready to save.", completed_at=now())
     except DownloadCancelled:
         update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     except DownloadTooLarge as exc:
         update_job(job_id, status="failed", phase="Failed", error=str(exc), message=str(exc))
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as exc:
         event = CANCEL_EVENTS.get(job_id)
-        if event and event.is_set():  # downloader wrapped our cancel exception
+        if event and event.is_set():
             update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-            shutil.rmtree(job_dir, ignore_errors=True)
+            if job_dir is not None:
+                shutil.rmtree(job_dir, ignore_errors=True)
             return
         message = clean_error(exc)
         update_job(job_id, status="failed", phase="Failed", error=message, message=message)
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     finally:
         CANCEL_EVENTS.pop(job_id, None)
-
 
 def cleanup_once() -> None:
     cutoff = now() - JOB_TTL_SECONDS
