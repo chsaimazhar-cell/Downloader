@@ -22,7 +22,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
 # The source file currently has spaces in its GitHub filename.
-COPY ["drift (1).py", "drift.py"]
+COPY drift.py .
 
 USER appuser
 VOLUME ["/data"]
