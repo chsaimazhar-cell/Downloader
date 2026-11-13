@@ -1845,7 +1845,7 @@ def find_media(job_dir: Path) -> Path | None:
         if p.is_file()
         and p.suffix.lower() in MEDIA_SUFFIXES
         and ".part" not in p.name.lower()
-        and not re.search(r"\\.f\\d+\\.", p.name)
+        and not re.search(r"\.f\d+\.", p.name)
     ]
     if not candidates:
         candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
