@@ -1,6 +1,6 @@
 # Downloader
 
-A small web application for downloading publicly accessible videos through a browser. The Python backend uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) and FFmpeg. The frontend is embedded in the Python source file.
+A small web application for downloading publicly accessible videos through a browser. The Python backend uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) and FFmpeg. It verifies media output and converts incompatible streams to broadly compatible H.264/AAC MP4 when needed. The frontend is embedded in the Python source file.
 
 > **Use responsibly:** Only download media that you own, have permission to download, or are otherwise legally allowed to save. Respect each platform's terms, copyright, privacy, and local law. Drift does not support bypassing DRM, private accounts, or access controls.
 
