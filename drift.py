@@ -1781,7 +1781,7 @@ def ensure_compatible_mp4(media: Path, job_id: str) -> Path:
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
-        raise RuntimeError("FFmpeg is not available. Restart Drift so it can install it.")
+        raise RuntimeError("FFmpeg is not available. Install FFmpeg and restart Drift.")
     info = probe_media(media)
     if not info["video"]:
         raise RuntimeError("The downloaded file has no video track.")
@@ -1840,20 +1840,28 @@ def ensure_compatible_mp4(media: Path, job_id: str) -> Path:
 
 
 def find_media(job_dir: Path) -> Path | None:
-    candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
+    candidates = [
+        p for p in job_dir.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() in MEDIA_SUFFIXES
+        and ".part" not in p.name.lower()
+        and not re.search(r"\\.f\\d+\\.", p.name)
+    ]
+    if not candidates:
+        candidates = [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES]
     return max(candidates, key=lambda p: p.stat().st_size) if candidates else None
 
 
 def run_download(job_id: str, url: str, quality: str) -> None:
-    early = CANCEL_EVENTS.get(job_id)
-    if early and early.is_set():
-        update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-        CANCEL_EVENTS.pop(job_id, None)
-        return
-    job_dir = Path(tempfile.mkdtemp(prefix=f"drift-{job_id}-", dir=DOWNLOAD_ROOT))
-    update_job(job_id, job_dir=str(job_dir), status="downloading", phase="Downloading", progress=0,
-               message="Starting media transfer…")
+    job_dir = None
     try:
+        early = CANCEL_EVENTS.get(job_id)
+        if early and early.is_set():
+            update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
+            return
+        job_dir = Path(tempfile.mkdtemp(prefix=f"drift-{job_id}-", dir=DOWNLOAD_ROOT))
+        update_job(job_id, job_dir=str(job_dir), status="downloading", phase="Downloading", progress=0,
+                   message="Starting media transfer…")
         if yt_dlp is None:
             raise RuntimeError("yt-dlp is not installed. Run: python -m pip install -r requirements.txt")
         options = {
@@ -1866,18 +1874,23 @@ def run_download(job_id: str, url: str, quality: str) -> None:
             "continuedl": True, "retries": 3, "fragment_retries": 3, "socket_timeout": 20,
             "quiet": True,
         }
-        if CERTIFI_CA: options["ca_certs"] = CERTIFI_CA
+        if CERTIFI_CA:
+            options["ca_certs"] = CERTIFI_CA
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
         event = CANCEL_EVENTS.get(job_id)
-        if event and event.is_set(): raise DownloadCancelled()
+        if event and event.is_set():
+            raise DownloadCancelled()
         media = find_media(job_dir)
-        if media is None: raise RuntimeError("The media file was not created.")
+        if media is None:
+            raise RuntimeError("The media file was not created.")
         media = ensure_compatible_mp4(media, job_id)
         event = CANCEL_EVENTS.get(job_id)
-        if event and event.is_set(): raise DownloadCancelled()
+        if event and event.is_set():
+            raise DownloadCancelled()
         size = media.stat().st_size
-        if size > MAX_DOWNLOAD_BYTES: raise DownloadTooLarge("The final media file exceeded Drift's 500 MB limit.")
+        if size > MAX_DOWNLOAD_BYTES:
+            raise DownloadTooLarge("The final media file exceeded Drift's 500 MB limit.")
         title = info.get("title") or "Drift video"
         duration = info.get("duration_string")
         final_name = safe_filename(title)
@@ -1889,22 +1902,25 @@ def run_download(job_id: str, url: str, quality: str) -> None:
                    message="Your MP4 is ready to save.", completed_at=now())
     except DownloadCancelled:
         update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     except DownloadTooLarge as exc:
         update_job(job_id, status="failed", phase="Failed", error=str(exc), message=str(exc))
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as exc:
         event = CANCEL_EVENTS.get(job_id)
-        if event and event.is_set():  # downloader wrapped our cancel exception
+        if event and event.is_set():
             update_job(job_id, status="cancelled", phase="Cancelled", message="Download cancelled.")
-            shutil.rmtree(job_dir, ignore_errors=True)
+            if job_dir is not None:
+                shutil.rmtree(job_dir, ignore_errors=True)
             return
         message = clean_error(exc)
         update_job(job_id, status="failed", phase="Failed", error=message, message=message)
-        shutil.rmtree(job_dir, ignore_errors=True)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
     finally:
         CANCEL_EVENTS.pop(job_id, None)
-
 
 def cleanup_once() -> None:
     cutoff = now() - JOB_TTL_SECONDS
